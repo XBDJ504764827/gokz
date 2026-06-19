@@ -77,6 +77,7 @@ public Plugin myinfo =
 // =====[ CONSTANTS ]=====
 
 #define ROUTE_TEMP_DIR    "data/gokz-route/downloads"
+#define DISK_CACHE_DIR    "data/gokz-route/cache"      // downloaded R2 replays cached on disk: <map>/<mode>_<type>.replay[+.meta]
 #define LOCAL_CACHE_DIR   "data/gokz-r2upload/wrcache"   // owned by gokz-r2upload; files: <map>/0_<mode>_<type>.replay
 #define LOCAL_COURSE      0                       // gokz-r2upload caches main course as "0_..."
 #define ROUTE_INF         9999999.0               // stand-in for infinity when finding the closest segment
@@ -99,6 +100,7 @@ ConVar gCV_VerifyCert;
 ConVar gCV_ViewDist;
 ConVar gCV_HighlightColor;
 ConVar gCV_HighlightCount;
+ConVar gCV_InterpSteps;
 
 int gI_BeamModel = 0;
 char gC_Map[64];
@@ -111,20 +113,18 @@ int    gI_Mode[MAXPLAYERS + 1];
 int    gI_Type[MAXPLAYERS + 1];     // TimeType_Nub (tp) / TimeType_Pro (pro)
 
 // Per-client display preferences (persisted via clientprefs).
-// TP and PRO are mutually exclusive (at most one active). Full = green line, Next = yellow highlight.
-bool   gB_ShowTP[MAXPLAYERS + 1];
-bool   gB_ShowPRO[MAXPLAYERS + 1];
+// gI_RouteType picks which WR route to load (TP=save / PRO=no-skip). Full/Next are display toggles.
+int    gI_RouteType[MAXPLAYERS + 1];   // TimeType_Nub (tp) / TimeType_Pro (pro)
 bool   gB_ShowFull[MAXPLAYERS + 1];
 bool   gB_ShowNext[MAXPLAYERS + 1];
-Cookie gC_ShowTP;
-Cookie gC_ShowPRO;
+Cookie gC_RouteType;
 Cookie gC_ShowFull;
 Cookie gC_ShowNext;
 
 // !o (options) menu integration
 TopMenu       gTM_Options;
 TopMenuObject gTMO_Category;
-TopMenuObject gTMO_Toggle[4];   // 0=TP, 1=PRO, 2=Full, 3=Next
+TopMenuObject gTMO_Toggle[3];   // 0=Next, 1=Mode, 2=Full
 
 // Cache: parsed route origins per (mode, type) for the current map.
 // Key "mode_type" -> ArrayList(blocksize 3) of float[3] origins (plugin-owned).
@@ -139,8 +139,7 @@ public void OnPluginStart()
 {
 	CreateConVars();
 
-	gC_ShowTP   = RegClientCookie("gokz_route_show_tp",   "Route menu: show TP (save) route", CookieAccess_Private);
-	gC_ShowPRO  = RegClientCookie("gokz_route_show_pro",  "Route menu: show PRO (no-skip) route", CookieAccess_Private);
+	gC_RouteType = RegClientCookie("gokz_route_type", "Route menu: 0=TP(save), 1=PRO(no-skip)", CookieAccess_Private);
 	gC_ShowFull = RegClientCookie("gokz_route_show_full", "Route menu: show full route line", CookieAccess_Private);
 	gC_ShowNext = RegClientCookie("gokz_route_show_next", "Route menu: show next-step highlight", CookieAccess_Private);
 
@@ -169,12 +168,13 @@ static void CreateConVars()
 	gCV_Refresh     = AutoExecConfig_CreateConVar("gokz_route_refresh",     "0.3", "Redraw interval in seconds (keep this smaller than lifetime so there is never a gap).", _, true, 0.05);
 	gCV_Lifetime    = AutoExecConfig_CreateConVar("gokz_route_lifetime",    "0.7", "Beam lifetime in seconds (keep this larger than refresh so beams overlap and never flicker out).", _, true, 0.1);
 	gCV_Width       = AutoExecConfig_CreateConVar("gokz_route_width",       "2.0", "Beam width.", _, true, 0.1);
-	gCV_MinDist      = AutoExecConfig_CreateConVar("gokz_route_mindist",        "32",   "Downsample min distance between kept points (units).", _, true, 1.0);
-	gCV_MaxSeg       = AutoExecConfig_CreateConVar("gokz_route_maxseg",         "500",  "Hard cap on number of drawn segments.", _, true, 10.0);
+	gCV_MinDist      = AutoExecConfig_CreateConVar("gokz_route_mindist",        "16",   "Downsample min distance between kept points (units).", _, true, 1.0);
+	gCV_MaxSeg       = AutoExecConfig_CreateConVar("gokz_route_maxseg",         "1200", "Hard cap on number of drawn segments.", _, true, 10.0);
 	gCV_VerifyCert   = AutoExecConfig_CreateConVar("gokz_route_verify_cert",    "0",    "Verify HTTPS certificate when downloading from R2.", _, true, 0.0, true, 1.0);
 	gCV_ViewDist     = AutoExecConfig_CreateConVar("gokz_route_view_dist",      "1500", "Only draw route segments within this distance (units) of the player.", _, true, 50.0);
 	gCV_HighlightColor = AutoExecConfig_CreateConVar("gokz_route_highlight_color","255 255 0 255", "Highlight color \"R G B A\" (0-255).");
 	gCV_HighlightCount = AutoExecConfig_CreateConVar("gokz_route_highlight_count","5",    "Total number of segments to highlight around the player's current position.", _, true, 1.0);
+	gCV_InterpSteps    = AutoExecConfig_CreateConVar("gokz_route_interp_steps",    "4",    "Catmull-Rom spline sub-steps per segment (higher = smoother curve). 1 = disabled.", _, true, 1.0, true, 10.0);
 
 	AutoExecConfig_ExecuteFile();
 	AutoExecConfig_CleanFile();
@@ -239,6 +239,54 @@ static void EnsureDownloadsDir()
 	{
 		CreateDirectory(dir, 511);
 	}
+	BuildPath(Path_SM, dir, sizeof(dir), DISK_CACHE_DIR);  // data/gokz-route/cache
+	if (!DirExists(dir))
+	{
+		CreateDirectory(dir, 511);
+	}
+}
+
+// Per-map subdirectory under the disk cache.
+static void EnsureDiskCacheMapDir(const char[] map)
+{
+	char dir[PLATFORM_MAX_PATH];
+	BuildPath(Path_SM, dir, sizeof(dir), DISK_CACHE_DIR);
+	if (!DirExists(dir)) CreateDirectory(dir, 511);
+	BuildPath(Path_SM, dir, sizeof(dir), "%s/%s", DISK_CACHE_DIR, map);
+	if (!DirExists(dir)) CreateDirectory(dir, 511);
+}
+
+// Disk cache file path for a (map, mode, type) combo.
+static void BuildDiskCachePath(char[] buffer, int maxlength, const char[] map, int mode, int type)
+{
+	char modeStr[8]; char typeStr[4];
+	GetGOKZModeStr(modeStr, sizeof(modeStr), mode);
+	GetTypeStr(typeStr, sizeof(typeStr), type);
+	BuildPath(Path_SM, buffer, maxlength, "%s/%s/%s_%s.replay", DISK_CACHE_DIR, map, modeStr, typeStr);
+}
+
+// Read the cached replay's time_ms (freshness marker) from the .meta sidecar. -1 if none.
+static int ReadCachedTimeMs(const char[] replayPath)
+{
+	char metaPath[PLATFORM_MAX_PATH];
+	Format(metaPath, sizeof(metaPath), "%s.meta", replayPath);
+	if (!FileExists(metaPath)) return -1;
+	File f = OpenFile(metaPath, "r");
+	if (f == null) return -1;
+	char line[32];
+	f.ReadLine(line, sizeof(line));
+	delete f;
+	return StringToInt(line);
+}
+
+static void WriteCachedTimeMs(const char[] replayPath, int timeMs)
+{
+	char metaPath[PLATFORM_MAX_PATH];
+	Format(metaPath, sizeof(metaPath), "%s.meta", replayPath);
+	File f = OpenFile(metaPath, "w");
+	if (f == null) return;
+	f.WriteLine("%d", timeMs);
+	delete f;
 }
 
 
@@ -256,49 +304,42 @@ public void OnClientCookiesCached(int client)
 
 static void LoadClientPrefs(int client)
 {
-	gB_ShowTP[client]   = GetCookieBool(client, gC_ShowTP);
-	gB_ShowPRO[client]  = GetCookieBool(client, gC_ShowPRO);
+	// Route type: default TP (save). A cookie reads as empty ("\0") when never saved.
+	if (CookieHasValue(client, gC_RouteType))
+	{
+		gI_RouteType[client] = GetCookieBool(client, gC_RouteType) ? TimeType_Pro : TimeType_Nub;
+	}
+	else
+	{
+		gI_RouteType[client] = TimeType_Nub;  // default: save (tp)
+	}
+
+	// Full / Next display toggles: default OFF.
 	gB_ShowFull[client] = GetCookieBool(client, gC_ShowFull);
 	gB_ShowNext[client] = GetCookieBool(client, gC_ShowNext);
 
-	// First-time defaults: full + next on, routes off. A cookie reads as empty
-	// ("\0") when it has never been saved for this player.
-	if (!CookieHasValue(client, gC_ShowFull)) gB_ShowFull[client] = true;
-	if (!CookieHasValue(client, gC_ShowNext)) gB_ShowNext[client] = true;
-
-	// Enforce mutual exclusion (TP wins if both are somehow set).
-	if (gB_ShowTP[client] && gB_ShowPRO[client])
-	{
-		gB_ShowPRO[client] = false;
-	}
-
-	// Apply the saved route type, if any.
-	if (gB_ShowTP[client])      ApplyRouteType(client, TimeType_Nub);
-	else if (gB_ShowPRO[client]) ApplyRouteType(client, TimeType_Pro);
-	else                         gB_Active[client] = false;
+	UpdateRouteActive(client);
 }
 
-// type == -1 means turn the route off. TP and PRO are mutually exclusive.
-static void ApplyRouteType(int client, int type)
+// Re-evaluate whether a route should be active for this client, based on the
+// current display toggles and the chosen route type. Loads/caches as needed.
+static void UpdateRouteActive(int client)
 {
-	gB_ShowTP[client]  = (type == TimeType_Nub);
-	gB_ShowPRO[client] = (type == TimeType_Pro);
-	SetCookieBool(client, gC_ShowTP,  gB_ShowTP[client]);
-	SetCookieBool(client, gC_ShowPRO, gB_ShowPRO[client]);
-
 	if (!gCV_Enabled.BoolValue)
 	{
 		gB_Active[client] = false;
 		return;
 	}
 
-	if (type == -1)
+	// The route is only needed when at least one display toggle is on.
+	if (!gB_ShowFull[client] && !gB_ShowNext[client])
 	{
 		gB_Active[client] = false;
 		return;
 	}
 
 	int mode = GOKZ_GetCoreOption(client, Option_Mode);
+	int type = gI_RouteType[client];
 	gI_Mode[client] = mode;
 	gI_Type[client] = type;
 
@@ -309,7 +350,7 @@ static void ApplyRouteType(int client, int type)
 	}
 	else
 	{
-		// Not cached yet; fetch (R2/local) and it will activate on completion.
+		// Not cached yet; fetch (R2/local). It will activate on completion.
 		gB_Active[client] = false;
 		RequestRouteLoad(client, mode, type);
 	}
@@ -339,10 +380,9 @@ public void GOKZ_OnOptionsMenuReady(TopMenu topMenu)
 	}
 	gTM_Options = topMenu;
 
-	gTMO_Toggle[0] = gTM_Options.AddItem("gokz_route_tp",   TopMenuHandler_Toggles, gTMO_Category);
-	gTMO_Toggle[1] = gTM_Options.AddItem("gokz_route_pro",  TopMenuHandler_Toggles, gTMO_Category);
+	gTMO_Toggle[0] = gTM_Options.AddItem("gokz_route_next", TopMenuHandler_Toggles, gTMO_Category);
+	gTMO_Toggle[1] = gTM_Options.AddItem("gokz_route_mode", TopMenuHandler_Toggles, gTMO_Category);
 	gTMO_Toggle[2] = gTM_Options.AddItem("gokz_route_full", TopMenuHandler_Toggles, gTMO_Category);
-	gTMO_Toggle[3] = gTM_Options.AddItem("gokz_route_next", TopMenuHandler_Toggles, gTMO_Category);
 }
 
 public void TopMenuHandler_Category(TopMenu topmenu, TopMenuAction action, TopMenuObject topobj_id, int param, char[] buffer, int maxlength)
@@ -359,19 +399,15 @@ public void TopMenuHandler_Toggles(TopMenu topmenu, TopMenuAction action, TopMen
 	{
 		if (topobj_id == gTMO_Toggle[0])
 		{
-			Format(buffer, maxlength, "存点模式路线 - %s", gB_ShowTP[param] ? "开启" : "关闭");
+			Format(buffer, maxlength, "下一步路线 - %s", gB_ShowNext[param] ? "开启" : "关闭");
 		}
 		else if (topobj_id == gTMO_Toggle[1])
 		{
-			Format(buffer, maxlength, "裸跳模式路线 - %s", gB_ShowPRO[param] ? "开启" : "关闭");
+			Format(buffer, maxlength, "当前模式 - %s", gI_RouteType[param] == TimeType_Pro ? "裸跳" : "存点");
 		}
 		else if (topobj_id == gTMO_Toggle[2])
 		{
 			Format(buffer, maxlength, "完整路线 - %s", gB_ShowFull[param] ? "开启" : "关闭");
-		}
-		else if (topobj_id == gTMO_Toggle[3])
-		{
-			Format(buffer, maxlength, "下一步路线 - %s", gB_ShowNext[param] ? "开启" : "关闭");
 		}
 	}
 	else if (action == TopMenuAction_SelectOption)
@@ -379,21 +415,22 @@ public void TopMenuHandler_Toggles(TopMenu topmenu, TopMenuAction action, TopMen
 		int client = param;
 		if (topobj_id == gTMO_Toggle[0])
 		{
-			ApplyRouteType(client, gB_ShowTP[client] ? -1 : TimeType_Nub);
+			gB_ShowNext[client] = !gB_ShowNext[client];
+			SetCookieBool(client, gC_ShowNext, gB_ShowNext[client]);
+			UpdateRouteActive(client);
 		}
 		else if (topobj_id == gTMO_Toggle[1])
 		{
-			ApplyRouteType(client, gB_ShowPRO[client] ? -1 : TimeType_Pro);
+			// Cycle TP(save) <-> PRO(no-skip).
+			gI_RouteType[client] = (gI_RouteType[client] == TimeType_Pro) ? TimeType_Nub : TimeType_Pro;
+			SetCookieBool(client, gC_RouteType, gI_RouteType[client] == TimeType_Pro);
+			UpdateRouteActive(client);
 		}
 		else if (topobj_id == gTMO_Toggle[2])
 		{
 			gB_ShowFull[client] = !gB_ShowFull[client];
 			SetCookieBool(client, gC_ShowFull, gB_ShowFull[client]);
-		}
-		else if (topobj_id == gTMO_Toggle[3])
-		{
-			gB_ShowNext[client] = !gB_ShowNext[client];
-			SetCookieBool(client, gC_ShowNext, gB_ShowNext[client]);
+			UpdateRouteActive(client);
 		}
 		topmenu.Display(client, TopMenuPosition_LastCategory);
 	}
@@ -489,24 +526,66 @@ static void LoadRouteR2(int client, int mode, int type)
 		return;
 	}
 
-	// De-duplicate concurrent fetches for the same player+combo.
+	// ---- FAST PATH: if we already have a disk-cached replay for this combo, show it
+	// instantly and then silently refresh from R2 in the background.
+	char cachePath[PLATFORM_MAX_PATH];
+	BuildDiskCachePath(cachePath, sizeof(cachePath), gC_Map, mode, type);
+	if (FileExists(cachePath))
+	{
+		ArrayList origins = ParseReplayOrigins(cachePath);
+		if (origins != null)
+		{
+			StoreAndActivate(client, mode, type, origins);  // show the cached route right now
+		}
+		// Refresh in the background regardless (cheap meta check first).
+		BackgroundMetaRefresh(client, mode, type);
+		return;
+	}
+
+	// ---- COLD PATH: no disk cache, do a full download.
+	DownloadRouteFromR2(client, mode, type, true, 0);
+}
+
+// Full GET of the replay from R2.
+//   storeToDiskCache = also write the downloaded file into the disk cache (+ .meta).
+//   forcedTimeMs = if > 0, write this time_ms into .meta (we already know it from a meta query).
+static void DownloadRouteFromR2(int client, int mode, int type, bool storeToDiskCache, int forcedTimeMs)
+{
+	char url[512];
+	if (!BuildRouteURL(url, sizeof(url), mode, type))
+	{
+		if (client > 0 && IsClientInGame(client))
+			PrintToChat(client, "[Route] gokz_route_source_url is not set.");
+		return;
+	}
+
+	// De-duplicate concurrent fetches for the same combo (the file is shared across players).
 	char pkey[64];
-	int userid = GetClientUserId(client);
-	Format(pkey, sizeof(pkey), "%d_%d_%d", userid, mode, type);
+	Format(pkey, sizeof(pkey), "dl_%d_%d", mode, type);
 	int dummy;
 	if (gH_Pending.GetValue(pkey, dummy))
 	{
-		return;  // already fetching
+		return;  // already fetching this combo
 	}
 	gH_Pending.SetValue(pkey, 1);
 
+	int userid = (client > 0) ? GetClientUserId(client) : 0;
 	int combo = (mode & 0xFF) << 8 | (type & 0xFF);
+
+	// Carry storeToDiskCache + forcedTimeMs to the callback via a side StringMap entry.
+	char fkey[32];
+	Format(fkey, sizeof(fkey), "f_%d_%d", mode, type);
+	char flagStr[32];
+	Format(flagStr, sizeof(flagStr), "%d|%d", storeToDiskCache ? 1 : 0, forcedTimeMs);
+	gH_Pending.SetString(fkey, flagStr);
 
 	Handle req = SteamWorks_CreateHTTPRequest(k_EHTTPMethodGET, url);
 	if (req == null)
 	{
 		gH_Pending.Remove(pkey);
-		PrintToChat(client, "[Route] Failed to create HTTP request.");
+		gH_Pending.Remove(fkey);
+		if (client > 0 && IsClientInGame(client))
+			PrintToChat(client, "[Route] Failed to create HTTP request.");
 		return;
 	}
 	SteamWorks_SetHTTPRequestNetworkActivityTimeout(req, 30);
@@ -518,9 +597,109 @@ static void LoadRouteR2(int client, int mode, int type)
 	if (!SteamWorks_SendHTTPRequest(req))
 	{
 		gH_Pending.Remove(pkey);
+		gH_Pending.Remove(fkey);
 		delete req;
-		PrintToChat(client, "[Route] Failed to send HTTP request.");
+		if (client > 0 && IsClientInGame(client))
+			PrintToChat(client, "[Route] Failed to send HTTP request.");
 	}
+}
+
+// Background freshness check: GET ?meta=1 (tiny), compare time_ms, only do a full download if R2 is faster.
+static void BackgroundMetaRefresh(int client, int mode, int type)
+{
+	if (!SteamWorksAvailable()) return;
+
+	char url[512];
+	if (!BuildRouteURL(url, sizeof(url), mode, type)) return;
+	Format(url, sizeof(url), "%s?meta=1", url);
+
+	char pkey[64];
+	Format(pkey, sizeof(pkey), "meta_%d_%d", mode, type);
+	int dummy;
+	if (gH_Pending.GetValue(pkey, dummy)) return;  // already checking
+	gH_Pending.SetValue(pkey, 1);
+
+	int userid = (client > 0) ? GetClientUserId(client) : 0;
+	int combo = (mode & 0xFF) << 8 | (type & 0xFF);
+
+	Handle req = SteamWorks_CreateHTTPRequest(k_EHTTPMethodGET, url);
+	if (req == null)
+	{
+		gH_Pending.Remove(pkey);
+		return;
+	}
+	SteamWorks_SetHTTPRequestNetworkActivityTimeout(req, 15);
+	SteamWorks_SetHTTPRequestAbsoluteTimeoutMS(req, 15000);
+	SteamWorks_SetHTTPRequestRequiresVerifiedCertificate(req, gCV_VerifyCert.BoolValue);
+	SteamWorks_SetHTTPRequestContextValue(req, userid, combo);
+	SteamWorks_SetHTTPCallbacks(req, OnMetaRefreshCompleted);
+
+	if (!SteamWorks_SendHTTPRequest(req))
+	{
+		gH_Pending.Remove(pkey);
+		delete req;
+	}
+}
+
+public void OnMetaRefreshCompleted(Handle hRequest, bool bFailure, bool bRequestSuccessful, EHTTPStatusCode eStatusCode, any data1, any data2)
+{
+	int userid = data1;
+	int combo = data2;
+	int mode = (combo >> 8) & 0xFF;
+	int type = combo & 0xFF;
+	int client = GetClientOfUserId(userid);
+
+	char pkey[64];
+	Format(pkey, sizeof(pkey), "meta_%d_%d", mode, type);
+	gH_Pending.Remove(pkey);
+
+	if (!bRequestSuccessful || view_as<int>(eStatusCode) != 200)
+	{
+		delete hRequest;
+		return;  // meta check failed; silently keep the cached version
+	}
+
+	// Read the tiny JSON: { exists, time_ms, ... }
+	char body[256];
+	SteamWorks_GetHTTPResponseBodyData(hRequest, body, sizeof(body));
+	delete hRequest;
+
+	bool exists = (StrContains(body, "\"exists\":true") != -1);
+	if (!exists) return;  // R2 has nothing; keep cache
+
+	int r2TimeMs = ExtractJsonInt(body, "time_ms");
+
+	char cachePath[PLATFORM_MAX_PATH];
+	BuildDiskCachePath(cachePath, sizeof(cachePath), gC_Map, mode, type);
+	int localTimeMs = ReadCachedTimeMs(cachePath);
+
+	// Only refresh when R2 is (likely) faster:
+	//  - R2 time_ms unknown -> be safe and refresh (rare).
+	//  - local time_ms unknown -> refresh.
+	//  - R2 time_ms < local time_ms -> R2 is faster -> refresh.
+	bool needRefresh = false;
+	if (r2TimeMs < 0) needRefresh = true;
+	else if (localTimeMs < 0) needRefresh = true;
+	else if (r2TimeMs < localTimeMs) needRefresh = true;
+
+	if (needRefresh)
+	{
+		DownloadRouteFromR2(client, mode, type, true, r2TimeMs);
+	}
+}
+
+// Tiny JSON int extractor (avoids pulling a full JSON lib for one or two fields).
+static int ExtractJsonInt(const char[] json, const char[] key)
+{
+	char needle[32];
+	Format(needle, sizeof(needle), "\"%s\":", key);
+	int pos = StrContains(json, needle);
+	if (pos == -1) return -1;
+	pos += strlen(needle);
+	while (pos < strlen(json) && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+	if (pos >= strlen(json)) return -1;
+	if (json[pos] == 'n') return -1;  // null
+	return StringToInt(json[pos]);
 }
 
 public void OnR2DownloadCompleted(Handle hRequest, bool bFailure, bool bRequestSuccessful, EHTTPStatusCode eStatusCode, any data1, any data2)
@@ -532,8 +711,26 @@ public void OnR2DownloadCompleted(Handle hRequest, bool bFailure, bool bRequestS
 	int client = GetClientOfUserId(userid);
 
 	char pkey[64];
-	Format(pkey, sizeof(pkey), "%d_%d_%d", userid, mode, type);
+	Format(pkey, sizeof(pkey), "dl_%d_%d", mode, type);
 	gH_Pending.Remove(pkey);
+
+	// Retrieve the carry-over flags for this download.
+	char fkey[32];
+	Format(fkey, sizeof(fkey), "f_%d_%d", mode, type);
+	char flagStr[32];
+	bool hasFlags = gH_Pending.GetString(fkey, flagStr, sizeof(flagStr));
+	gH_Pending.Remove(fkey);
+	bool storeToDiskCache = false;
+	int forcedTimeMs = 0;
+	if (hasFlags)
+	{
+		char parts[2][16];
+		if (ExplodeString(flagStr, "|", parts, sizeof(parts), sizeof(parts[])) >= 2)
+		{
+			storeToDiskCache = (StringToInt(parts[0]) == 1);
+			forcedTimeMs = StringToInt(parts[1]);
+		}
+	}
 
 	if (!bRequestSuccessful || view_as<int>(eStatusCode) != 200)
 	{
@@ -545,11 +742,22 @@ public void OnR2DownloadCompleted(Handle hRequest, bool bFailure, bool bRequestS
 		return;
 	}
 
+	// Try to read time_ms from the response header (set by the Worker). Fallback to forcedTimeMs.
+	int timeMs = forcedTimeMs;
+	int hdrSize = 0;
+	if (SteamWorks_GetHTTPResponseHeaderSize(hRequest, "x-time-ms", hdrSize) && hdrSize > 0)
+	{
+		char hdr[32];
+		SteamWorks_GetHTTPResponseHeaderValue(hRequest, "x-time-ms", hdr, sizeof(hdr));
+		int hdrMs = StringToInt(hdr);
+		if (hdrMs > 0) timeMs = hdrMs;
+	}
+
 	// Dump the response body to a temp file, then parse it.
 	EnsureDownloadsDir();
-	char path[PLATFORM_MAX_PATH];
-	BuildPath(Path_SM, path, sizeof(path), "%s/%d_%d_%d.replay", ROUTE_TEMP_DIR, userid, mode, type);
-	if (!SteamWorks_WriteHTTPResponseBodyToFile(hRequest, path))
+	char dlPath[PLATFORM_MAX_PATH];
+	BuildPath(Path_SM, dlPath, sizeof(dlPath), "%s/%d_%d_%d.replay", ROUTE_TEMP_DIR, userid, mode, type);
+	if (!SteamWorks_WriteHTTPResponseBodyToFile(hRequest, dlPath))
 	{
 		delete hRequest;
 		if (client > 0 && IsClientInGame(client))
@@ -560,7 +768,7 @@ public void OnR2DownloadCompleted(Handle hRequest, bool bFailure, bool bRequestS
 	}
 	delete hRequest;
 
-	ArrayList origins = ParseReplayOrigins(path);
+	ArrayList origins = ParseReplayOrigins(dlPath);
 	if (origins == null)
 	{
 		if (client > 0 && IsClientInGame(client))
@@ -570,13 +778,35 @@ public void OnR2DownloadCompleted(Handle hRequest, bool bFailure, bool bRequestS
 		return;
 	}
 
-	if (client > 0 && IsClientInGame(client))
+	// Persist into the disk cache (+ .meta with time_ms) so future opens are instant.
+	if (storeToDiskCache)
 	{
-		StoreAndActivate(client, mode, type, origins);
+		EnsureDiskCacheMapDir(gC_Map);
+		char cachePath[PLATFORM_MAX_PATH];
+		BuildDiskCachePath(cachePath, sizeof(cachePath), gC_Map, mode, type);
+		File_Copy(dlPath, cachePath);
+		if (timeMs > 0) WriteCachedTimeMs(cachePath, timeMs);
 	}
-	else
+
+	// Update the in-memory cache too (and any client currently viewing this combo).
+	StoreAndRefreshViewers(mode, type, origins);
+}
+
+// Shared between cache-hit and fresh-download: downsample, store in memory cache,
+// and re-activate any client currently displaying this combo.
+static void StoreAndRefreshViewers(int mode, int type, ArrayList origins)
+{
+	ArrayList downsampled = Downsample(origins, gCV_MinDist.FloatValue, gCV_MaxSeg.IntValue);
+	delete origins;
+	downsampled = SplineInterpolateRoute(downsampled, gCV_InterpSteps.IntValue);
+	CacheRoute(mode, type, downsampled);  // cache owns downsampled
+
+	for (int c = 1; c <= MaxClients; c++)
 	{
-		delete origins;
+		if (gB_Active[c] && IsClientInGame(c) && gI_Mode[c] == mode && gI_Type[c] == type)
+		{
+			PrintToChat(c, "[路线] 已更新为最新 WR 路线 (%d 点)。", downsampled.Length);
+		}
 	}
 }
 
@@ -584,13 +814,14 @@ static void StoreAndActivate(int client, int mode, int type, ArrayList origins)
 {
 	ArrayList downsampled = Downsample(origins, gCV_MinDist.FloatValue, gCV_MaxSeg.IntValue);
 	delete origins;
+	downsampled = SplineInterpolateRoute(downsampled, gCV_InterpSteps.IntValue);
 	CacheRoute(mode, type, downsampled);  // cache owns downsampled
 	gI_Mode[client] = mode;
 	gI_Type[client] = type;
 
-	// Only activate if the player still wants this type (they may have turned it
-	// off in the menu while the download was in flight).
-	bool want = (type == TimeType_Nub) ? gB_ShowTP[client] : (type == TimeType_Pro ? gB_ShowPRO[client] : false);
+	// Only activate if the player still wants this type AND still has a display
+	// toggle on (they may have changed the menu while the download was in flight).
+	bool want = (gI_RouteType[client] == type) && (gB_ShowFull[client] || gB_ShowNext[client]);
 	gB_Active[client] = want;
 	if (want)
 	{
@@ -784,6 +1015,94 @@ static ArrayList Downsample(ArrayList origins, float minDist, int maxSeg)
 	return out;
 }
 
+// Catmull-Rom spline interpolation to smooth out the route path.
+// Takes a downsampled route and adds (steps-1) intermediate points between each
+// pair of existing points, creating a smooth curved path through the original points.
+// Returns a new ArrayList; the caller must free the input if needed.
+static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
+{
+	if (route == null || route.Length < 2 || steps <= 1)
+	{
+		return route;
+	}
+
+	ArrayList out = new ArrayList(3);
+	int n = route.Length;
+
+	// Control points for Catmull-Rom: for segment [i, i+1] we use points
+	// P[i-1], P[i], P[i+1], P[i+2] as the 4 control points.
+	// At boundaries we mirror the first/last point to avoid pinching.
+	for (int i = 0; i < n - 1; i++)
+	{
+		// Get the 4 control points for this segment.
+		float P0[3], P1[3], P2[3], P3[3];
+		route.GetArray(i, P1);     // start of segment
+		route.GetArray(i + 1, P2); // end of segment
+
+		// P0 = previous point (mirror if at first segment)
+		if (i > 0)
+		{
+			route.GetArray(i - 1, P0);
+		}
+		else
+		{
+			// Reflect P1 across P0 generated from P1 and P2
+			for (int a = 0; a < 3; a++)
+				P0[a] = P1[a] + (P1[a] - P2[a]);
+		}
+
+		// P3 = next next point (mirror if at last segment)
+		if (i + 2 < n)
+		{
+			route.GetArray(i + 2, P3);
+		}
+		else
+		{
+			for (int a = 0; a < 3; a++)
+				P3[a] = P2[a] + (P2[a] - P1[a]);
+		}
+
+		// Always include the first point of each segment (avoids duplicates).
+		if (i == 0)
+		{
+			out.PushArray(P1);
+		}
+
+		// Catmull-Rom: t goes from 0 (P1) to 1 (P2).
+		// Generate (steps) sub-segments, but skip t=0 (already added or will be next).
+		// We generate t = 1/steps, 2/steps, ..., (steps-1)/steps
+		// and t = 1.0 (endpoint, included at t=1.0)
+		float stepSize = 1.0 / float(steps);
+		float pt[3];
+		for (int s = 1; s <= steps; s++)
+		{
+			float t = float(s) * stepSize;
+			if (t > 1.0) t = 1.0;
+
+			// Catmull-Rom basis
+			float t2 = t * t;
+			float t3 = t2 * t;
+			float h1 =  2.0 * t3 - 3.0 * t2 + 1.0;            // basis for P1
+			float h2 = -2.0 * t3 + 3.0 * t2;                   // basis for P2
+			float h3 =       t3 - 2.0 * t2 + t;                // basis for tangent at P1
+			float h4 =       t3 -       t2;                    // basis for tangent at P2
+
+			for (int a = 0; a < 3; a++)
+			{
+				// Tangents (Catmull-Rom: tangent at P1 = (P2 - P0)/2, at P2 = (P3 - P1)/2)
+				float T1 = (P2[a] - P0[a]) * 0.5;
+				float T2 = (P3[a] - P1[a]) * 0.5;
+				pt[a] = h1 * P1[a] + h2 * P2[a] + h3 * T1 + h4 * T2;
+			}
+
+			out.PushArray(pt);
+		}
+	}
+
+	delete route;
+	return out;
+}
+
 
 
 // =====[ DRAWING ]=====
@@ -901,6 +1220,25 @@ static void DrawBeam(int client, const float a[3], const float b[3], float life,
 {
 	TE_SetupBeamPoints(a, b, gI_BeamModel, 0, 0, 0, life, width, width, 1, 0.0, color, 0);
 	TE_SendToClient(client);
+}
+
+// Byte-for-byte file copy (shavit-style, same as gokz-replays/nav.sp).
+static bool File_Copy(const char[] source, const char[] destination)
+{
+	File src = OpenFile(source, "rb");
+	if (src == null) return false;
+	File dst = OpenFile(destination, "wb");
+	if (dst == null) { delete src; return false; }
+	int[] buffer = new int[32];
+	int cache = 0;
+	while (!IsEndOfFile(src))
+	{
+		cache = ReadFile(src, buffer, 32, 1);
+		dst.Write(buffer, cache, 1);
+	}
+	delete src;
+	delete dst;
+	return true;
 }
 
 // Shortest distance from point p to segment [a, b].

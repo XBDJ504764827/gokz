@@ -181,7 +181,8 @@ public Action GOKZ_RP_OnReplaySaved(int client, int replayType,
 	}
 
 	int mode = GOKZ_GetCoreOption(client, Option_Mode);
-	UploadWR(map, mode, course, timeType, filePath);
+	int timeMs = RoundToNearest(time * 1000.0);
+	UploadWR(map, mode, course, timeType, timeMs, filePath);
 	return Plugin_Continue;
 }
 
@@ -189,7 +190,7 @@ public Action GOKZ_RP_OnReplaySaved(int client, int replayType,
 
 // =====[ WR UPLOAD ]=====
 
-static void UploadWR(const char[] map, int mode, int course, int timeType, const char[] newWRPath)
+static void UploadWR(const char[] map, int mode, int course, int timeType, int timeMs, const char[] newWRPath)
 {
 	if (!gB_SteamWorksOK)
 	{
@@ -207,7 +208,7 @@ static void UploadWR(const char[] map, int mode, int course, int timeType, const
 	BuildCachePath(cacheFile, sizeof(cacheFile), map, course, mode, timeType);
 
 	// Upload the single fastest replay for this (mode, type) as tp / pro (no rank).
-	bool ok = UploadReplayFile(map, gokzMode, typeStr, newWRPath);
+	bool ok = UploadReplayFile(map, gokzMode, typeStr, timeMs, newWRPath);
 
 	// Update the cache to the new record.
 	if (ok && FileExists(newWRPath))
@@ -282,7 +283,7 @@ static void BackfillExistingRecords(const char[] map)
 			LogMessage("[gokz-r2upload] Backfill tp0 -> wr/%s/%s/%s0.replay", gokzMode, map, typeStr);
 		}
 
-		if (UploadReplayFile(map, gokzMode, typeStr, fullPath))
+		if (UploadReplayFile(map, gokzMode, typeStr, 0, fullPath))
 		{
 			EnsureCacheDir(map);
 			File_Copy(fullPath, cacheFile);
@@ -350,7 +351,7 @@ static int FindTimeTypeByName(const char[] name)
 
 // =====[ UPLOAD PRIMITIVE ]=====
 
-static bool UploadReplayFile(const char[] map, const char[] gokzMode, const char[] typeStr, const char[] filePath)
+static bool UploadReplayFile(const char[] map, const char[] gokzMode, const char[] typeStr, int timeMs, const char[] filePath)
 {
 	char url[256];
 	gCV_Url.GetString(url, sizeof(url));
@@ -391,6 +392,12 @@ static bool UploadReplayFile(const char[] map, const char[] gokzMode, const char
 	SteamWorks_SetHTTPRequestHeaderValue(hRequest, "X-GOKZ-Mode", gokzMode);
 	SteamWorks_SetHTTPRequestHeaderValue(hRequest, "X-Map", map);
 	SteamWorks_SetHTTPRequestHeaderValue(hRequest, "X-Route", typeStr);
+	if (timeMs > 0)
+	{
+		char timeMsStr[16];
+		IntToString(timeMs, timeMsStr, sizeof(timeMsStr));
+		SteamWorks_SetHTTPRequestHeaderValue(hRequest, "X-Time-Ms", timeMsStr);
+	}
 
 	char contentType[] = "application/octet-stream";
 	if (!SteamWorks_SetHTTPRequestRawPostBodyFromFile(hRequest, contentType, filePath))
@@ -472,6 +479,7 @@ public Action Command_TestUpload(int client, int args)
 	SteamWorks_SetHTTPRequestHeaderValue(req, "X-API-Key", key);
 	SteamWorks_SetHTTPRequestHeaderValue(req, "X-Map", "connection-test");
 	SteamWorks_SetHTTPRequestHeaderValue(req, "X-Route", "test");
+	SteamWorks_SetHTTPRequestHeaderValue(req, "X-Time-Ms", "0");
 	SteamWorks_SetHTTPRequestRawPostBody(req, "application/octet-stream", body, strlen(body));
 	SteamWorks_SetHTTPCallbacks(req, OnTestUploadCompleted);
 	bool sent = SteamWorks_SendHTTPRequest(req);
