@@ -103,11 +103,30 @@
 		"chi"		"前进 10 秒"
 		"ru"		"Пропустить 10с"
 	}
+	"Replay Controls - Skip 3"
+	{
+		"en"		"Skip 3s"
+		"chi"		"前进 3 秒"
+		"ru"		"Пропустить 3с"
+	}
 	"Replay Controls - Rewind"
 	{
 		"en"		"Rewind 10s"
 		"chi"		"回退 10 秒"
 		"ru"		"Перемотать 10с"
+	}
+	"Replay Controls - Rewind 3"
+	{
+		"en"		"Rewind 3s"
+		"chi"		"回退 3 秒"
+		"ru"		"Перемотать 3с"
+	}
+	"Replay Controls - Speed"
+	{
+		"#format"	"{1:s}"
+		"en"		"Speed: {1}x"
+		"chi"		"当前倍速 {1}x"
+		"ru"		"Скорость: {1}x"
 	}
 	"Replay Controls - Freecam"
 	{
