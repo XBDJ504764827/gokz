@@ -48,6 +48,17 @@
 	  gokz_route_highlight   "1"   highlight the segment closest to the player
 	  gokz_route_highlight_color "255 255 0 255" highlight color
 	  gokz_route_highlight_count "5" segments to highlight around the player's position
+
+	  --- One-shot playback command ---
+	  sm_follow / !follow  plays the WR path around the player's current position:
+	  the line is drawn progressively from (now-back) to (now+fwd) seconds of the
+	  WR run at 1x speed (so it visibly grows from start to end over back+fwd sec).
+	  Once the head reaches (now+fwd), playback stops and the whole line vanishes
+	  immediately. The player's current WR-time is inferred from the nearest route
+	  segment AT THE MOMENT the command is issued (fixed snapshot; free to move).
+	  gokz_route_follow_back   "3.0"  playback starts this many seconds BEHIND the player
+	  gokz_route_follow_fwd    "3.0"  playback ends this many seconds AHEAD of the player
+	  gokz_route_follow_color  "0 255 255 255"  playback beam color "R G B A"
 */
 
 #include <sourcemod>
@@ -101,6 +112,9 @@ ConVar gCV_ViewDist;
 ConVar gCV_HighlightColor;
 ConVar gCV_HighlightCount;
 ConVar gCV_InterpSteps;
+ConVar gCV_FollowBack;
+ConVar gCV_FollowFwd;
+ConVar gCV_FollowColor;
 
 int gI_BeamModel = 0;
 char gC_Map[64];
@@ -112,8 +126,19 @@ bool   gB_Active[MAXPLAYERS + 1];
 int    gI_Mode[MAXPLAYERS + 1];
 int    gI_Type[MAXPLAYERS + 1];     // TimeType_Nub (tp) / TimeType_Pro (pro)
 
+// Per-client one-shot playback state (!follow): the WR path line is drawn
+// progressively from T-back to T+fwd at 1x speed; once it reaches T+fwd the
+// whole line vanishes immediately. Player can move freely.
+bool   gB_PlayActive[MAXPLAYERS + 1];
+float  gF_PlayStartGameTime[MAXPLAYERS + 1];  // GetGameTime() when playback began
+float  gF_PlayT0[MAXPLAYERS + 1];             // WR-time where playback starts (T-back)
+float  gF_PlayT1[MAXPLAYERS + 1];             // WR-time where playback ends   (T+fwd)
+int    gI_PlayMode[MAXPLAYERS + 1];
+int    gI_PlayType[MAXPLAYERS + 1];
+
 // Per-client display preferences (persisted via clientprefs).
-// gI_RouteType picks which WR route to load (TP=save / PRO=no-skip). Full/Next are display toggles.
+// gI_RouteType picks which WR route to load (TP=save / PRO=no-skip). Full/Next are
+// continuous display toggles. Follow is a one-shot command (no persisted state).
 int    gI_RouteType[MAXPLAYERS + 1];   // TimeType_Nub (tp) / TimeType_Pro (pro)
 bool   gB_ShowFull[MAXPLAYERS + 1];
 bool   gB_ShowNext[MAXPLAYERS + 1];
@@ -146,6 +171,8 @@ public void OnPluginStart()
 	gH_Cache = new StringMap();
 	gH_Pending = new StringMap();
 
+	RegConsoleCmd("sm_follow", Command_Follow, "Draw a one-shot WR path window (a few seconds before/after your position).");
+
 	// Late load: preferences for players already online when the plugin (re)loads.
 	for (int i = 1; i <= MaxClients; i++)
 	{
@@ -175,6 +202,9 @@ static void CreateConVars()
 	gCV_HighlightColor = AutoExecConfig_CreateConVar("gokz_route_highlight_color","255 255 0 255", "Highlight color \"R G B A\" (0-255).");
 	gCV_HighlightCount = AutoExecConfig_CreateConVar("gokz_route_highlight_count","5",    "Total number of segments to highlight around the player's current position.", _, true, 1.0);
 	gCV_InterpSteps    = AutoExecConfig_CreateConVar("gokz_route_interp_steps",    "4",    "Catmull-Rom spline sub-steps per segment (higher = smoother curve). 1 = disabled.", _, true, 1.0, true, 10.0);
+	gCV_FollowBack     = AutoExecConfig_CreateConVar("gokz_route_follow_back",   "3.0",  "Follow playback: seconds behind the player where playback starts.", _, true, 0.0);
+	gCV_FollowFwd      = AutoExecConfig_CreateConVar("gokz_route_follow_fwd",    "3.0",  "Follow playback: seconds ahead of the player where playback ends.", _, true, 0.0);
+	gCV_FollowColor    = AutoExecConfig_CreateConVar("gokz_route_follow_color",  "0 255 255 255", "Follow playback beam color \"R G B A\" (0-255).");
 
 	AutoExecConfig_ExecuteFile();
 	AutoExecConfig_CleanFile();
@@ -218,6 +248,7 @@ public void OnMapEnd()
 public void OnClientDisconnect(int client)
 {
 	gB_Active[client] = false;
+	gB_PlayActive[client] = false;
 }
 
 public void OnConfigsExecuted()
@@ -315,8 +346,8 @@ static void LoadClientPrefs(int client)
 	}
 
 	// Full / Next display toggles: default OFF.
-	gB_ShowFull[client] = GetCookieBool(client, gC_ShowFull);
-	gB_ShowNext[client] = GetCookieBool(client, gC_ShowNext);
+	gB_ShowFull[client]   = GetCookieBool(client, gC_ShowFull);
+	gB_ShowNext[client]   = GetCookieBool(client, gC_ShowNext);
 
 	UpdateRouteActive(client);
 }
@@ -331,7 +362,8 @@ static void UpdateRouteActive(int client)
 		return;
 	}
 
-	// The route is only needed when at least one display toggle is on.
+	// The route is only needed when at least one continuous display toggle is on.
+	// (Follow is a one-shot command and loads its own route on demand.)
 	if (!gB_ShowFull[client] && !gB_ShowNext[client])
 	{
 		gB_Active[client] = false;
@@ -380,9 +412,9 @@ public void GOKZ_OnOptionsMenuReady(TopMenu topMenu)
 	}
 	gTM_Options = topMenu;
 
-	gTMO_Toggle[0] = gTM_Options.AddItem("gokz_route_next", TopMenuHandler_Toggles, gTMO_Category);
-	gTMO_Toggle[1] = gTM_Options.AddItem("gokz_route_mode", TopMenuHandler_Toggles, gTMO_Category);
-	gTMO_Toggle[2] = gTM_Options.AddItem("gokz_route_full", TopMenuHandler_Toggles, gTMO_Category);
+	gTMO_Toggle[0] = gTM_Options.AddItem("gokz_route_next",   TopMenuHandler_Toggles, gTMO_Category);
+	gTMO_Toggle[1] = gTM_Options.AddItem("gokz_route_mode",   TopMenuHandler_Toggles, gTMO_Category);
+	gTMO_Toggle[2] = gTM_Options.AddItem("gokz_route_full",   TopMenuHandler_Toggles, gTMO_Category);
 }
 
 public void TopMenuHandler_Category(TopMenu topmenu, TopMenuAction action, TopMenuObject topobj_id, int param, char[] buffer, int maxlength)
@@ -434,6 +466,59 @@ public void TopMenuHandler_Toggles(TopMenu topmenu, TopMenuAction action, TopMen
 		}
 		topmenu.Display(client, TopMenuPosition_LastCategory);
 	}
+}
+
+// sm_follow / !follow: one-shot playback. Locates the player's current WR-time
+// from the nearest route segment (snapshot at this moment), then draws the WR
+// path progressively from (T-back) to (T+fwd) at 1x speed -- the line grows from
+// start to end. Once the head reaches (T+fwd), playback stops and the whole
+// line vanishes immediately. The player can move freely during playback.
+public Action Command_Follow(int client, int args)
+{
+	if (client <= 0 || !IsClientInGame(client))
+	{
+		return Plugin_Handled;
+	}
+	if (!gCV_Enabled.BoolValue)
+	{
+		PrintToChat(client, "[路线] 插件已被管理员关闭。");
+		return Plugin_Handled;
+	}
+
+	int mode = GOKZ_GetCoreOption(client, Option_Mode);
+	int type = gI_RouteType[client];
+
+	ArrayList route = GetCachedRoute(mode, type);
+	if (route == null)
+	{
+		// Not cached yet -- kick off a load and ask the player to retry shortly.
+		RequestRouteLoad(client, mode, type);
+		PrintToChat(client, "[路线] WR 路线还在加载，请几秒后再用 !follow 。");
+		return Plugin_Handled;
+	}
+
+	// Snapshot the player's current WR-time from the nearest route segment.
+	float playerTime = NearestRouteTime(client, route);
+	if (playerTime < 0.0)
+	{
+		PrintToChat(client, "[路线] 无法定位你在 WR 路线上的位置，请靠近路线后再试。");
+		return Plugin_Handled;
+	}
+
+	float t0 = playerTime - gCV_FollowBack.FloatValue;
+	float t1 = playerTime + gCV_FollowFwd.FloatValue;
+	if (t0 < 0.0) t0 = 0.0;
+
+	gB_PlayActive[client]         = true;
+	gF_PlayStartGameTime[client]  = GetGameTime();
+	gF_PlayT0[client]             = t0;
+	gF_PlayT1[client]             = t1;
+	gI_PlayMode[client]           = mode;
+	gI_PlayType[client]           = type;
+
+	float dur = t1 - t0;
+	PrintToChat(client, "[路线] 开始播放 WR 路线 (%.1f 秒)，可自由移动。", dur);
+	return Plugin_Handled;
 }
 
 // ---- cookie helpers ----
@@ -819,8 +904,8 @@ static void StoreAndActivate(int client, int mode, int type, ArrayList origins)
 	gI_Mode[client] = mode;
 	gI_Type[client] = type;
 
-	// Only activate if the player still wants this type AND still has a display
-	// toggle on (they may have changed the menu while the download was in flight).
+	// Only activate if the player still wants this type AND still has a continuous
+	// display toggle on (they may have changed the menu while the download was in flight).
 	bool want = (gI_RouteType[client] == type) && (gB_ShowFull[client] || gB_ShowNext[client]);
 	gB_Active[client] = want;
 	if (want)
@@ -833,7 +918,8 @@ static void StoreAndActivate(int client, int mode, int type, ArrayList origins)
 
 // =====[ REPLAY PARSING ]=====
 
-// Returns a plugin-owned ArrayList(blocksize 3) of origins, or null on failure.
+// Returns a plugin-owned ArrayList(blocksize 4) of [x, y, z, timeSec] entries, or null on failure.
+// timeSec is the WR-run time of that tick (i / tickrate). Used by follow mode.
 // Mirrors gokz-replays/playback.sp LoadFormatVersion2Replay.
 static ArrayList ParseReplayOrigins(const char[] path)
 {
@@ -897,9 +983,10 @@ static ArrayList ParseReplayOrigins(const char[] path)
 	int steamID; file.ReadInt32(steamID);
 	int bMode;   file.ReadInt8(bMode);
 	int bStyle;  file.ReadInt8(bStyle);
-	int sens;    file.ReadInt32(sens);
-	int mYaw;    file.ReadInt32(mYaw);
-	int tickrate;file.ReadInt32(tickrate);
+	int sensRaw; file.ReadInt32(sensRaw);
+	int mYawRaw; file.ReadInt32(mYawRaw);
+	int tickrateRaw; file.ReadInt32(tickrateRaw);
+	float tickrate = view_as<float>(tickrateRaw);
 	int tickCount; file.ReadInt32(tickCount);
 	int weapon;  file.ReadInt32(weapon);
 	int knife;   file.ReadInt32(knife);
@@ -915,10 +1002,16 @@ static ArrayList ParseReplayOrigins(const char[] path)
 	int rCourse;   file.ReadInt8(rCourse);
 	int teleports; file.ReadInt32(teleports);
 
-	ArrayList origins = new ArrayList(3);
+	ArrayList origins = new ArrayList(4);
 
 	any tickDataArray[RP_V2_TICK_DATA_BLOCKSIZE];
 	for (int i = 0; i < RP_V2_TICK_DATA_BLOCKSIZE; i++) tickDataArray[i] = 0;
+
+	float invTickrate = 0.0;
+	if (tickrate > 0.0)
+	{
+		invTickrate = 1.0 / tickrate;
+	}
 
 	for (int i = 0; i < tickCount; i++)
 	{
@@ -932,40 +1025,41 @@ static ArrayList ParseReplayOrigins(const char[] path)
 			}
 		}
 
-		float origin[3];
-		origin[0] = view_as<float>(tickDataArray[RPDELTA_ORIGIN_X]);
-		origin[1] = view_as<float>(tickDataArray[RPDELTA_ORIGIN_Y]);
-		origin[2] = view_as<float>(tickDataArray[RPDELTA_ORIGIN_Z]);
+		float pt[4];
+		pt[0] = view_as<float>(tickDataArray[RPDELTA_ORIGIN_X]);
+		pt[1] = view_as<float>(tickDataArray[RPDELTA_ORIGIN_Y]);
+		pt[2] = view_as<float>(tickDataArray[RPDELTA_ORIGIN_Z]);
 
 		// Skip zeroed-out trailing ticks (jump-replay quirk safety).
-		if (origin[0] == 0.0 && origin[1] == 0.0 && origin[2] == 0.0)
+		if (pt[0] == 0.0 && pt[1] == 0.0 && pt[2] == 0.0)
 		{
 			break;
 		}
-		origins.PushArray(origin);
+		pt[3] = float(i) * invTickrate;  // WR-run time of this tick, in seconds
+		origins.PushArray(pt);
 	}
 
 	delete file;
 	return origins;
 }
 
-// Downsample by min distance; also hard-cap segment count.
+// Downsample by min distance; also hard-cap segment count. Preserves the time slot [3].
 static ArrayList Downsample(ArrayList origins, float minDist, int maxSeg)
 {
-	ArrayList out = new ArrayList(3);
+	ArrayList out = new ArrayList(4);
 	if (origins == null || origins.Length == 0)
 	{
 		return out;
 	}
 
 	// First pass: keep points that moved at least minDist from the last kept point.
-	float last[3];
+	float last[4];
 	origins.GetArray(0, last);
 	out.PushArray(last);
 
 	for (int i = 1; i < origins.Length; i++)
 	{
-		float p[3];
+		float p[4];
 		origins.GetArray(i, p);
 		float dx = p[0] - last[0];
 		float dy = p[1] - last[1];
@@ -979,9 +1073,9 @@ static ArrayList Downsample(ArrayList origins, float minDist, int maxSeg)
 	}
 
 	// Always keep the final point.
-	float finalP[3];
+	float finalP[4];
 	origins.GetArray(origins.Length - 1, finalP);
-	float lp[3];
+	float lp[4];
 	out.GetArray(out.Length - 1, lp);
 	if (!(finalP[0] == lp[0] && finalP[1] == lp[1] && finalP[2] == lp[2]))
 	{
@@ -991,10 +1085,10 @@ static ArrayList Downsample(ArrayList origins, float minDist, int maxSeg)
 	// If still too many segments, step through uniformly.
 	if (out.Length - 1 > maxSeg && out.Length > 2)
 	{
-		ArrayList capped = new ArrayList(3);
+		ArrayList capped = new ArrayList(4);
 		int step = RoundToCeil(float(out.Length - 1) / float(maxSeg));
 		if (step < 1) step = 1;
-		float tmp[3];
+		float tmp[4];
 		for (int i = 0; i < out.Length; i += step)
 		{
 			out.GetArray(i, tmp);
@@ -1002,7 +1096,7 @@ static ArrayList Downsample(ArrayList origins, float minDist, int maxSeg)
 		}
 		// ensure last point
 		out.GetArray(out.Length - 1, tmp);
-		float cl[3];
+		float cl[4];
 		capped.GetArray(capped.Length - 1, cl);
 		if (!(tmp[0] == cl[0] && tmp[1] == cl[1] && tmp[2] == cl[2]))
 		{
@@ -1026,7 +1120,7 @@ static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
 		return route;
 	}
 
-	ArrayList out = new ArrayList(3);
+	ArrayList out = new ArrayList(4);
 	int n = route.Length;
 
 	// Control points for Catmull-Rom: for segment [i, i+1] we use points
@@ -1035,7 +1129,7 @@ static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
 	for (int i = 0; i < n - 1; i++)
 	{
 		// Get the 4 control points for this segment.
-		float P0[3], P1[3], P2[3], P3[3];
+		float P0[4], P1[4], P2[4], P3[4];
 		route.GetArray(i, P1);     // start of segment
 		route.GetArray(i + 1, P2); // end of segment
 
@@ -1047,7 +1141,7 @@ static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
 		else
 		{
 			// Reflect P1 across P0 generated from P1 and P2
-			for (int a = 0; a < 3; a++)
+			for (int a = 0; a < 4; a++)
 				P0[a] = P1[a] + (P1[a] - P2[a]);
 		}
 
@@ -1058,7 +1152,7 @@ static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
 		}
 		else
 		{
-			for (int a = 0; a < 3; a++)
+			for (int a = 0; a < 4; a++)
 				P3[a] = P2[a] + (P2[a] - P1[a]);
 		}
 
@@ -1069,11 +1163,8 @@ static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
 		}
 
 		// Catmull-Rom: t goes from 0 (P1) to 1 (P2).
-		// Generate (steps) sub-segments, but skip t=0 (already added or will be next).
-		// We generate t = 1/steps, 2/steps, ..., (steps-1)/steps
-		// and t = 1.0 (endpoint, included at t=1.0)
 		float stepSize = 1.0 / float(steps);
-		float pt[3];
+		float pt[4];
 		for (int s = 1; s <= steps; s++)
 		{
 			float t = float(s) * stepSize;
@@ -1087,7 +1178,7 @@ static ArrayList SplineInterpolateRoute(ArrayList route, int steps)
 			float h3 =       t3 - 2.0 * t2 + t;                // basis for tangent at P1
 			float h4 =       t3 -       t2;                    // basis for tangent at P2
 
-			for (int a = 0; a < 3; a++)
+			for (int a = 0; a < 4; a++)
 			{
 				// Tangents (Catmull-Rom: tangent at P1 = (P2 - P0)/2, at P2 = (P3 - P1)/2)
 				float T1 = (P2[a] - P0[a]) * 0.5;
@@ -1124,7 +1215,18 @@ public Action Timer_RefreshRoutes(Handle timer)
 
 	for (int client = 1; client <= MaxClients; client++)
 	{
-		if (!gB_Active[client] || !IsClientInGame(client))
+		if (!IsClientInGame(client))
+		{
+			continue;
+		}
+
+		// One-shot !follow playback runs independently of the continuous toggles.
+		if (gB_PlayActive[client])
+		{
+			UpdateFollowPlayback(client);
+		}
+
+		if (!gB_Active[client])
 		{
 			continue;
 		}
@@ -1139,10 +1241,10 @@ public Action Timer_RefreshRoutes(Handle timer)
 	return Plugin_Continue;
 }
 
-// Draws only the route segments near the player.
+// Draws route segments near the player (continuous modes only).
 //   gB_ShowFull -> draw the nearby segments (green "full route")
 //   gB_ShowNext -> draw the highlight band around the closest segment (yellow "next step")
-// Both are independent per-player toggles.
+// Both are independent per-player toggles. (Follow is a separate one-shot command.)
 static void DrawRouteToClient(int client, ArrayList route, const int normalColor[4], const int highlightColor[4], float life, float width)
 {
 	int n = route.Length;
@@ -1169,14 +1271,17 @@ static void DrawRouteToClient(int client, ArrayList route, const int normalColor
 
 	// Pass 1: distance from the player to each segment, and the closest one.
 	float[] segDist = new float[n - 1];
-	float a[3], b[3];
+	float a[4], b[4];
+	float oa[3], ob[3];
 	int bestIdx = -1;
 	float bestDist = ROUTE_INF;
 	for (int i = 0; i < n - 1; i++)
 	{
 		route.GetArray(i, a);
 		route.GetArray(i + 1, b);
-		segDist[i] = PointToSegmentDistance(playerOrigin, a, b);
+		oa[0] = a[0]; oa[1] = a[1]; oa[2] = a[2];
+		ob[0] = b[0]; ob[1] = b[1]; ob[2] = b[2];
+		segDist[i] = PointToSegmentDistance(playerOrigin, oa, ob);
 		if (segDist[i] < bestDist)
 		{
 			bestDist = segDist[i];
@@ -1205,14 +1310,147 @@ static void DrawRouteToClient(int client, ArrayList route, const int normalColor
 
 		route.GetArray(i, a);
 		route.GetArray(i + 1, b);
+		oa[0] = a[0]; oa[1] = a[1]; oa[2] = a[2];
+		ob[0] = b[0]; ob[1] = b[1]; ob[2] = b[2];
 		if (doHL)
 		{
-			DrawBeam(client, a, b, life, width, highlightColor);
+			DrawBeam(client, oa, ob, life, width, highlightColor);
 		}
 		else
 		{
-			DrawBeam(client, a, b, life, width, normalColor);
+			DrawBeam(client, oa, ob, life, width, normalColor);
 		}
+	}
+}
+
+// Returns the WR-time (seconds) of the route point nearest to the player, or
+// -1.0 if it can't be determined (no route / can't read origin).
+// On success, also returns via out-params the segment index and its distance.
+static float NearestRouteTime(int client, ArrayList route)
+{
+	int n = route.Length;
+	if (n < 2)
+	{
+		return -1.0;
+	}
+
+	float playerOrigin[3];
+	if (!GetClientAbsOrigin(client, playerOrigin))
+	{
+		return -1.0;
+	}
+
+	float a[4], b[4];
+	float oa[3], ob[3];
+	int bestIdx = -1;
+	float bestDist = ROUTE_INF;
+	for (int i = 0; i < n - 1; i++)
+	{
+		route.GetArray(i, a);
+		route.GetArray(i + 1, b);
+		oa[0] = a[0]; oa[1] = a[1]; oa[2] = a[2];
+		ob[0] = b[0]; ob[1] = b[1]; ob[2] = b[2];
+		float d = PointToSegmentDistance(playerOrigin, oa, ob);
+		if (d < bestDist)
+		{
+			bestDist = d;
+			bestIdx = i;
+		}
+	}
+	if (bestIdx < 0)
+	{
+		return -1.0;
+	}
+
+	route.GetArray(bestIdx, a);
+	return a[3];
+}
+
+// Per-frame update for one-shot !follow playback. Animates the WR path drawing
+// itself from gF_PlayT0 to gF_PlayT1 at 1x WR-speed: every frame we redraw the
+// whole portion of the path the playback head has already swept over, so the
+// line visibly grows from the start. Once the head reaches gF_PlayT1 the line is
+// fully drawn and playback ends -- on the next frame nothing is drawn, so the
+// entire line vanishes at once (beams use a short life so they don't linger).
+// Player can move freely during playback; the snapshot is fixed at command time.
+static void UpdateFollowPlayback(int client)
+{
+	ArrayList route = GetCachedRoute(gI_PlayMode[client], gI_PlayType[client]);
+	if (route == null)
+	{
+		gB_PlayActive[client] = false;
+		return;
+	}
+	int n = route.Length;
+	if (n < 2)
+	{
+		gB_PlayActive[client] = false;
+		return;
+	}
+
+	float t0 = gF_PlayT0[client];
+	float t1 = gF_PlayT1[client];
+
+	float elapsed = GetGameTime() - gF_PlayStartGameTime[client];  // 1x speed => seconds of WR
+	float head    = t0 + elapsed;                                  // current playback WR-time
+
+	// Playback complete: stop drawing. Since we redraw every frame and use a short
+	// beam life, stopping now makes the whole line vanish immediately.
+	if (head >= t1)
+	{
+		gB_PlayActive[client] = false;
+		return;
+	}
+
+	int color[4];
+	ParseColor(gCV_FollowColor, color);
+	// Short life so the line disappears instantly when playback ends/stops.
+	// Must cover the gap until the next refresh tick so it doesn't flicker out mid-play.
+	float life  = gCV_Refresh.FloatValue * 1.5 + 0.05;
+	if (life > gCV_Lifetime.FloatValue) life = gCV_Lifetime.FloatValue;
+	float width = gCV_Width.FloatValue;
+
+	float a[4], b[4];
+	for (int i = 0; i < n - 1; i++)
+	{
+		route.GetArray(i, a);
+		route.GetArray(i + 1, b);
+		float ta = a[3];
+		float tb = b[3];
+
+		if (ta > head) break;          // not reached yet (route is time-ordered)
+		if (tb > t1)  tb = t1;          // clamp the very last segment to the window end
+
+		// Skip anything entirely before the window start.
+		if (tb <= t0) continue;
+
+		// If the segment straddles the window start, start it at t0.
+		float segT0 = (ta < t0) ? t0 : ta;
+
+		// Interpolate endpoints so the line grows smoothly up to the head position.
+		float pa[3], pb[3];
+		if (segT0 > ta)
+		{
+			float f = (segT0 - ta) / (tb - ta);
+			pa[0] = a[0] + (b[0] - a[0]) * f;
+			pa[1] = a[1] + (b[1] - a[1]) * f;
+			pa[2] = a[2] + (b[2] - a[2]) * f;
+		}
+		else
+		{
+			pa[0] = a[0]; pa[1] = a[1]; pa[2] = a[2];
+		}
+
+		float segTEnd = (tb <= head) ? tb : head;  // draw up to the head if mid-segment
+		float fEnd = (segTEnd - ta) / (tb - ta);
+		pb[0] = a[0] + (b[0] - a[0]) * fEnd;
+		pb[1] = a[1] + (b[1] - a[1]) * fEnd;
+		pb[2] = a[2] + (b[2] - a[2]) * fEnd;
+
+		// Skip degenerate (zero-length) slivers.
+		if (GetVectorDistance(pa, pb) < 0.1) continue;
+
+		DrawBeam(client, pa, pb, life, width, color);
 	}
 }
 
@@ -1328,6 +1566,7 @@ static void ClearCache()
 	for (int c = 1; c <= MaxClients; c++)
 	{
 		gB_Active[c] = false;
+		gB_PlayActive[c] = false;
 	}
 }
 
