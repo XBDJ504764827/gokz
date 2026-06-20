@@ -92,7 +92,7 @@ public Plugin myinfo =
 #define LOCAL_CACHE_DIR   "data/gokz-r2upload/wrcache"   // owned by gokz-r2upload; files: <map>/0_<mode>_<type>.replay
 #define LOCAL_COURSE      0                       // gokz-r2upload caches main course as "0_..."
 #define ROUTE_INF         9999999.0               // stand-in for infinity when finding the closest segment
-#define ROUTE_CATEGORY    "寻路菜单"              // top-level !o category (native GOKZ way, like Paint)
+#define ROUTE_CATEGORY    "GOKZ Route"           // internal !o category key; display text is formatted in the handler
 
 
 
@@ -388,7 +388,7 @@ static void UpdateRouteActive(int client)
 	}
 }
 
-// ---- !o options menu: a top-level "寻路菜单" category (same pattern as gokz-paint) ----
+// ---- !o options menu: a top-level route category (same pattern as gokz-paint) ----
 
 public void GOKZ_OnOptionsMenuCreated(TopMenu topMenu)
 {
